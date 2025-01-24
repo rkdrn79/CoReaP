@@ -37,7 +37,7 @@ def main(args):
     model = get_model(args)
 
     # wandb
-    wandb.init(project='multkan', name=args.save_dir)
+    wandb.init(project='CoReaP', name=args.save_dir)
 
     training_args = TrainingArguments(
         output_dir=f"./model/{args.save_dir}",

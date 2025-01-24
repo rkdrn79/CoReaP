@@ -17,7 +17,7 @@ class CoReaPDataCollator:
         mask_edge_img = torch.stack(mask_edge_img).to(torch.bfloat16 if self.args.bf16 else torch.float16)
 
         mask_line_img = [torch.tensor(feature['mask_line_img']) for feature in features]
-        mask_line_img = torch.stack(mask_line_img).to(torch
+        mask_line_img = torch.stack(mask_line_img).to(torch.bfloat16 if self.args.bf16 else torch.float16)
                                                       
         img = [torch.tensor(feature['img']) for feature in features]
         img = torch.stack(img).to(torch.bfloat16 if self.args.bf16 else torch.float16)
