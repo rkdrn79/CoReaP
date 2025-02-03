@@ -4,122 +4,103 @@ from transformers.trainer import Trainer
 from torch import nn
 import torch
 import numpy as np
+from src.utils.losses.pcp import PerceptualLoss
 
 class CoReaPTrainer(Trainer):
-    def __init__(self, **kwds):
-        super().__init__(**kwds)
-
-        self.criteria = nn.CrossEntropyLoss()
-        
-    def compute_loss(self, model, inputs, return_outputs=False):
-        mask_img = inputs['mask_img']
-        mask = inputs['mask']
-        mask_edge_img = inputs['mask_edge_img']
-        mask_line_img = inputs['mask_line_img']
-        label = inputs['img']
-        
-        output = model.forward(mask_img, mask, mask_edge_img, mask_line_img)
-
-        loss = self.criteria(output, label)
-
-        if return_outputs:
-            return loss, output, label
-        
-        return loss
-
-    def training_step(self, model: nn.Module, inputs: Dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
-        model.train()
-        inputs = self._prepare_inputs(inputs)
-        
-        # Forward pass
-        loss = self.compute_loss(model, inputs)
-        
-        # Backward pass (여기서 커스터마이징 가능)
-        loss = loss / self.args.gradient_accumulation_steps  # Gradient Accumulation 고려
-        loss.backward()
-        
-        # 예: gradient clipping 추가
-        if self.args.max_grad_norm is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), self.args.max_grad_norm)
-        
-        return loss.detach()
-    
-    def prediction_step(
-            self,
-            model: nn.Module,
-            inputs: Dict[str, Union[torch.Tensor, Any]],
-            prediction_loss_only: bool,
-            ignore_keys: Optional[List[str]] = None,
-    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        model.eval()
-        
-        with torch.no_grad():
-            eval_loss, pred, label = self.compute_loss(model,inputs,True)
-        
-        return (eval_loss,pred,label)
-
-class CoReaPTrainer(Trainer):
-    def __init__(self, generator, discriminator, g_optimizer, d_optimizer, **kwargs):
-        """
-        Custom Trainer for GAN.
-        
-        Args:
-            generator: Generator model.
-            discriminator: Discriminator model.
-            g_optimizer: Optimizer for generator.
-            d_optimizer: Optimizer for discriminator.
-            g_loss_fn: Loss function for generator.
-            d_loss_fn: Loss function for discriminator.
-            **kwargs: Other arguments for Hugging Face Trainer.
-        """
+    def __init__(self, generator, discriminator, g_optimizer, d_optimizer, 
+                r1_gamma=10, pcp_ratio=1.0, l1_ratio=1.0, **kwargs):
         super().__init__(**kwargs)
         self.generator = generator
         self.discriminator = discriminator
         self.g_optimizer = g_optimizer
         self.d_optimizer = d_optimizer
+        self.r1_gamma = r1_gamma
+        self.pcp_ratio = pcp_ratio
+        self.l1_ratio = l1_ratio
+        self.pcp = PerceptualLoss(layer_weights=dict(conv4_4=1/4, conv5_4=1/2)).to(self.args.device)
 
     def compute_loss(self, model, inputs, return_outputs=False):
-        """
-        Overwrite compute_loss to define GAN-specific loss computation.
-        """
-        mask_img = inputs['mask_img']
-        mask = inputs['mask']
-        mask_edge_img = inputs['mask_edge_img']
-        mask_line_img = inputs['mask_line_img']
-        label = inputs['img']
+        # 데이터 준비
+        mask_img = inputs['mask_img'].to(self.args.device)
+        mask = inputs['mask'].to(self.args.device)
+        label = inputs['img'].to(self.args.device)
+        
+        # Generator 포워드 패스
+        gen_img, gen_img_stg1 = self.generator(mask_img, mask)
+        
+        # Discriminator 포워드 패스
+        with torch.no_grad():
+            real_logits, real_logits_stg1 = self.discriminator(label, mask, label)
+            fake_logits, fake_logits_stg1 = self.discriminator(gen_img.detach(), mask, gen_img_stg1.detach())
+        
+        # Generator Loss 계산
+        g_loss_gan = torch.nn.functional.softplus(-fake_logits).mean()
+        g_loss_l1 = torch.nn.functional.l1_loss(gen_img, label)
+        pcp_loss, _ = self.pcp(gen_img, label)
+        g_loss = g_loss_gan + self.pcp_ratio * pcp_loss + self.l1_ratio * g_loss_l1
+        
+        # Discriminator Loss 계산
+        d_loss_real = torch.nn.functional.softplus(-real_logits).mean()
+        d_loss_fake = torch.nn.functional.softplus(fake_logits).mean()
+        d_loss = d_loss_real + d_loss_fake
+        
+        # R1 Regularization
+        if self.r1_gamma > 0:
+            real_img_tmp = label.detach().requires_grad_(True)
+            real_logits_tmp, _ = self.discriminator(real_img_tmp, mask, real_img_tmp)
+            r1_grads = torch.autograd.grad(
+                outputs=real_logits_tmp.sum(), 
+                inputs=real_img_tmp, 
+                create_graph=True
+            )[0]
+            r1_penalty = r1_grads.square().sum([1,2,3]).mean()
+            d_loss += self.r1_gamma * 0.5 * r1_penalty
 
-        batch_size = mask_img.size(0)
-
-        # TODO: Add model forward pass and backward pass here
-
-        # Combine losses for logging
-        combined_loss = d_loss + g_loss
-
-        return (combined_loss, {"d_loss": d_loss, "g_loss": g_loss}) if return_outputs else combined_loss
+        combined_loss = g_loss + d_loss
+        
+        if return_outputs:
+            return (combined_loss, {
+                "g_loss": g_loss,
+                "d_loss": d_loss,
+                "gen_img": gen_img,
+                "real_img": label
+            })
+        return combined_loss
 
     def training_step(self, model, inputs):
-        """
-        Custom training step to handle the two models.
-        """
+        # Discriminator 업데이트
+        self.discriminator.requires_grad_(True)
+        self.generator.requires_grad_(False)
+        
         loss, outputs = self.compute_loss(model, inputs, return_outputs=True)
-        self.log({"train_loss": loss.item(), "d_loss": outputs["d_loss"].item(), "g_loss": outputs["g_loss"].item()})
+        self.d_optimizer.zero_grad()
+        outputs['d_loss'].backward(retain_graph=True)
+        self.d_optimizer.step()
+        
+        # Generator 업데이트
+        self.discriminator.requires_grad_(False)
+        self.generator.requires_grad_(True)
+        
+        self.g_optimizer.zero_grad()
+        outputs['g_loss'].backward()
+        self.g_optimizer.step()
+        
         return loss
-    
-    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
-        """
-        Custom prediction step for GAN to compute loss during prediction.
-        """
-        real_data = inputs["real_data"]
-        batch_size = real_data.size(0)
 
+    def prediction_step(self, model, inputs, prediction_loss_only=False, ignore_keys=None):
+        # Validation을 위한 예측 단계
         self.generator.eval()
         self.discriminator.eval()
-
-        # TODO: Add model forward pass here
-
-        # If prediction_loss_only, return only loss
+        
+        with torch.no_grad():
+            mask_img = inputs['mask_img'].to(self.args.device)
+            mask = inputs['mask'].to(self.args.device)
+            label = inputs['img'].to(self.args.device)
+            
+            gen_img, _ = self.generator(mask_img, mask)
+            loss = self.compute_loss(model, inputs)
+            
         if prediction_loss_only:
-            return combined_loss, None, None
-
-        # Otherwise, return loss and predictions
-        return combined_loss, fake_data, real_data
+            return loss.detach(), None, None
+            
+        return loss.detach(), gen_img, label
