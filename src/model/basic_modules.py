@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from einops import rearrange
-from deformable_conv_v3 import Deformable_Conv2d
+from src.model.deformable_conv_v3 import Deformable_Conv2d
 
 
 #--------------------- 모듈 만드는 데에 필요한 함수 정의 -----------------------
@@ -867,7 +867,7 @@ class TransformerBlock(nn.Module):
             if self.use_ln:
                 x = self.mha_ln(x)
             x = rearrange(x, 'B (H W) C -> B C H W', H = H, W = W)
-            
+
             x, mask = self.attn(x, mask)
             x = x + residual
 
@@ -1299,6 +1299,7 @@ class FirstStage(nn.Module):
                  activation='lrelu',
                  use_4input = False,        # whether use masked edge & line images in high frequency
                  use_ln = False,            # Whether use LayerNormalization
+                 few_high = False,          # Whether use fewer blocks in high-freqeuncy
                  ):
         super().__init__()
         res = 64
@@ -1310,6 +1311,7 @@ class FirstStage(nn.Module):
 
         self.enc_conv = nn.ModuleList()
         self.use_4input = use_4input
+        self.few_high = few_high
 
         down_time = int(np.log2(img_resolution // res)) # 몇 번 resolution 줄일 것인지
 
@@ -1322,10 +1324,17 @@ class FirstStage(nn.Module):
         ratios = [1, 1/2, 1/2, 2, 2]
         head_num = 6
 
+        if self.few_high:
+            high_depths = [1, 2, 2, 2, 1]
+        else:
+            high_depths = [i for i in depths]
+
+
+
         self.low = nn.ModuleList()
         self.high = nn.ModuleList()
 
-        for i, depth in enumerate(depths):
+        for i, depth in enumerate(zip(depths, high_depths)):
             res = int(res * ratios[i])
 
             if ratios[i] < 1: # feature map이 작아지면
@@ -1339,12 +1348,12 @@ class FirstStage(nn.Module):
                 merge = None
 
             self.high.append(
-                BasicLayer(dim=dim, input_resolution=[res, res], depth=depth,
+                BasicLayer(dim=dim, input_resolution=[res, res], depth=depth[1],
                            head_num = head_num, downsample=merge, frequency = 'high', use_ln = use_ln)
             )
 
             self.low.append(
-                BasicLayer(dim=dim, input_resolution=[res, res], depth=depth,
+                BasicLayer(dim=dim, input_resolution=[res, res], depth=depth[0],
                            head_num = head_num, downsample=merge, frequency = 'low', use_ln = False)
             )
 
@@ -1494,6 +1503,7 @@ class SynthesisNet(nn.Module):
                  demodulate     = True,
                  use_4input     = False,        # whether use masked edge & line images in high frequency
                  use_ln         = False,        # Whether use LayerNormalization
+                 few_high = False,          # Whether use fewer blocks in high-freqeuncy
                  ):
         super().__init__()
         resolution_log2 = int(np.log2(img_resolution))
@@ -1506,7 +1516,7 @@ class SynthesisNet(nn.Module):
 
         # first stage
         self.first_stage = FirstStage(img_channels, img_resolution=img_resolution, w_dim=w_dim, use_noise=False,
-                                      demodulate=demodulate, use_4input = use_4input, use_ln = use_ln)
+                                      demodulate=demodulate, use_4input = use_4input, use_ln = use_ln, few_high = few_high)
 
         # second stage
         self.enc = Encoder(resolution_log2, img_channels, activation, patch_size=5, channels=16)
@@ -1556,8 +1566,9 @@ class Generator(nn.Module):
                  w_dim,                     # Intermediate latent (W) dimensionality.
                  img_resolution,            # resolution of generated image
                  img_channels,              # Number of input color channels.
-                 use_4input = False,              # whether input masked edge & line images
+                 use_4input = False,        # whether input masked edge & line images
                  use_ln = False,            # Whether use LayerNormalization
+                 few_high = False,          # Whether use fewer blocks in high-freqeuncy
                  synthesis_kwargs = {},     # Arguments for SynthesisNetwork.
                  mapping_kwargs   = {},     # Arguments for MappingNetwork.
                  ):
@@ -1573,6 +1584,7 @@ class Generator(nn.Module):
                                       img_channels=img_channels,
                                       use_4input = use_4input,
                                       use_ln = use_ln,
+                                      few_high = few_high,
                                       **synthesis_kwargs)
         
         # Getting the 'ws'
@@ -1678,10 +1690,10 @@ class Discriminator(torch.nn.Module):
 
 if __name__ == '__main__':
     # mac 환경이라서 그냥 cpu
-    device = torch.device('cpu')
+    device = torch.device('cuda:0')
     batch = 1
     res = 512
-    G = Generator(z_dim=512, c_dim=0, w_dim=512, img_resolution=512, img_channels=3, use_4input = True, use_ln = True).to(device)
+    G = Generator(z_dim=512, c_dim=0, w_dim=512, img_resolution=512, img_channels=3, use_4input = True, use_ln = True, few_high = True).to(device)
     D = Discriminator(c_dim=0, img_resolution=res, img_channels=3).to(device)
     img = torch.randn(batch, 3, res, res).to(device)
     mask = torch.randn(batch, 1, res, res).to(device)
@@ -1698,12 +1710,14 @@ if __name__ == '__main__':
     def count(block):
         return sum(p.numel() for p in block.parameters()) / 10 ** 6
     print(f'Params: {count(G)} milions')
-        
+
+
     with torch.no_grad():
         img, img_stg1, high_freq = G(img, mask, z, None, return_stg1=True, edge = edge, line = line)
-        # B, 2, H, W -> B, (edge, line), H, W
+        #(B, 2, H, W)
+        # index 0: edge
+        # index 1: line
+
     print('output of G:', img.shape, img_stg1.shape, high_freq.shape)
     score, score_stg1 = D(img, mask, img_stg1, None)
     print('output of D:', score.shape, score_stg1.shape)
-
-

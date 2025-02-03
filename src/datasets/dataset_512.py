@@ -13,7 +13,7 @@ import zipfile
 import PIL.Image
 import json
 import torch
-import dnnlib
+#import dnnlib
 import random
 
 try:
@@ -21,7 +21,11 @@ try:
 except ImportError:
     pyspng = None
 
-from datasets.mask_generator_512 import RandomMask
+import pdb
+from skimage.color import rgb2gray
+from skimage.feature import canny
+
+from src.datasets.mask_generator_512 import RandomMask
 
 #----------------------------------------------------------------------------
 
@@ -105,7 +109,8 @@ class Dataset(torch.utils.data.Dataset):
         return label.copy()
 
     def get_details(self, idx):
-        d = dnnlib.EasyDict()
+        # d = dnnlib.EasyDict() -> dnnlib is not available
+        d = {}
         d.raw_idx = int(self._raw_idx[idx])
         d.xflip = (int(self._xflip[idx]) != 0)
         d.raw_label = self._get_raw_labels()[d.raw_idx].copy()
@@ -261,6 +266,16 @@ class ImageFolderMaskDataset(Dataset):
         labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
         return labels
 
+    def _extract_edge(self, image, sigma=2):
+        if not isinstance(image, np.ndarray):
+            image = np.array(image)  # numpy 배열로 변환
+
+        # (3, 512, 512) → (512, 512, 3)로 변환 (CHW → HWC)
+        image = image.transpose(1, 2, 0)
+
+        gray = rgb2gray(image)
+        return canny(gray, sigma=sigma, mask=None).astype(np.float32)
+
     def __getitem__(self, idx):
         image = self._load_raw_image(self._raw_idx[idx])
 
@@ -271,16 +286,55 @@ class ImageFolderMaskDataset(Dataset):
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
         mask = RandomMask(image.shape[-1], hole_range=self._hole_range)  # hole as 0, reserved as 1
-        return image.copy(), mask, self.get_label(idx)
+        edge = self._extract_edge(image.copy())
+        # dim (512,512) -> (1,512,512)
+        edge = edge[np.newaxis, :, :]
+        # image normalization
+        image = image / 255.0
+
+        return {
+            'img': image.copy(),
+            'mask_img': image.copy() * mask,
+            'edge': edge,
+            'mask_edge_img': edge * mask,
+            'mask': mask,
+            #'label': self.get_label(idx),
+        }
+        return image.copy(), mask, edge, self.get_label(idx)
+
 
 
 if __name__ == '__main__':
+    from matplotlib import pyplot as plt
     res = 512
-    dpath = '/data/liwenbo/datasets/Places365/standard/val_large'
+    dpath = '/home/work/research/CoReaP/data/celeba_hq/train'
     D = ImageFolderMaskDataset(path=dpath)
     print(D.__len__())
     for i in range(D.__len__()):
         print(i)
-        a, b, c = D.__getitem__(i)
-        if a.shape != (3, 512, 512):
-            print(i, a.shape)
+        a = D.__getitem__(i)
+
+        # shape print
+        print(a['img'].shape, a['mask_img'].shape, a['edge'].shape, a['mask_edge_img'].shape, a['mask'].shape)
+
+        plt.imshow(a['img'].transpose(1, 2, 0))
+        plt.savefig("image_a.png")  # 파일로 저장
+        plt.close()  # 리소스 해제
+
+        plt.imshow(a['mask_img'].transpose(1, 2, 0))
+        plt.savefig("mask_img_a.png")
+        plt.close()
+
+        plt.imshow(a['edge'].transpose(1, 2, 0), cmap='gray')
+        plt.savefig("edge_a.png")
+        plt.close()
+
+        plt.imshow(a['mask_edge_img'].transpose(1, 2, 0), cmap='gray')
+        plt.savefig("mask_edge_img_a.png")
+        plt.close()
+
+        plt.imshow(a['mask'].transpose(1, 2, 0), cmap='gray')
+        plt.savefig("mask_a.png")
+        plt.close()
+        print(a)
+        break

@@ -1,13 +1,11 @@
-from src.dataset.coreap_dataset import CoReaPDataset
-from src.dataset.coreap_datacollator import CoReaPDataCollator
+from src.datasets.dataset_512 import ImageFolderMaskDataset
+from src.datasets.coreap_datacollator import CoReaPDataCollator
 
 def get_dataset(args):
 
     if args.is_train:
-        train_data = None
-        valid_data = None 
-        train_dataset = CoReaPDataset(args, train_data)
-        valid_dataset = CoReaPDataset(args, valid_data)
+        train_dataset = ImageFolderMaskDataset(path = './data/celeba_hq/train')
+        valid_dataset = ImageFolderMaskDataset(path = './data/celeba_hq/val') 
         data_collator = CoReaPDataCollator(args)
 
         return train_dataset, valid_dataset, data_collator
