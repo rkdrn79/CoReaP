@@ -162,7 +162,7 @@ class Dataset(torch.utils.data.Dataset):
 #----------------------------------------------------------------------------
 
 
-class ImageFolderMaskDataset(Dataset):
+class ImageFolderMaskDataset_512(Dataset):
     def __init__(self,
         path,                   # Path to directory or zip.
         resolution      = None, # Ensure specific resolution, None = highest available.
@@ -252,6 +252,29 @@ class ImageFolderMaskDataset(Dataset):
 
         return image
 
+    def _load_resized_image(self, raw_idx, res=256):
+        fname = self._image_fnames[raw_idx]
+        with self._open_file(fname) as f:
+            if pyspng is not None and self._file_ext(fname) == '.png':
+                image = pyspng.load(f.read())
+            else:
+                image = np.array(PIL.Image.open(f))
+        
+        if image.ndim == 2:
+            image = image[:, :, np.newaxis]  # HW => HWC
+
+        # for grayscale image
+        if image.shape[2] == 1:
+            image = np.repeat(image, 3, axis=2)
+        
+        # Resize the image to the target size (256x256)
+        image = cv2.resize(image, (res, res))
+
+        # Convert to CHW format (channels first)
+        image = np.ascontiguousarray(image.transpose(2, 0, 1))  # HWC => CHW
+
+        return image
+
     def _load_raw_labels(self):
         fname = 'labels.json'
         if fname not in self._all_fnames:
@@ -300,7 +323,6 @@ class ImageFolderMaskDataset(Dataset):
             'mask': mask,
             #'label': self.get_label(idx),
         }
-        return image.copy(), mask, edge, self.get_label(idx)
 
 
 

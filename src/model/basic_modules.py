@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from src.model.deformable_conv_v3 import Deformable_Conv2d
 
+import pdb
 
 #--------------------- 모듈 만드는 데에 필요한 함수 정의 -----------------------
 def get_style_code(a, b): # 그냥 concat
@@ -93,7 +94,7 @@ class FullyConnected_Layer(nn.Module):
         )
 
         self.bias = nn.Parameter(
-            torch.full([out_features], np.float32(bias_init))
+            torch.full([out_features], bias_init, dtype=torch.float32)
         ) if bias else None
 
         self.activation = activation
@@ -281,7 +282,7 @@ class ModulatedConv2d(nn.Module): #Style을 배치/Out 채널별로 적용해주
             weight = weight * decoefs.view(B, self.out_channels, 1, 1, 1) #(B, Out, In, K, K)
 
         
-        x = x.view(1, B * in_channels, H, W)
+        x = x.reshape(-1, B * in_channels, H, W)
 
         if self.up != 1:
             # ConvTranspose2d
@@ -464,9 +465,9 @@ class MappingNet(torch.nn.Module): # Generator랑 Discriminator에 쓰이는 cla
         x = None
         with torch.autograd.profiler.record_function('input'): # 각 단계 프로파일링(CPU & GPU 사용량 등을 확인)을 위한 함수 (https://jh-bk.tistory.com/20)
             if self.z_dim > 0:
-                x = normalize_2nd_moment(z.to(torch.float32))
+                x = normalize_2nd_moment(z)#to(torch.float32))
             if self.c_dim > 0:
-                y = normalize_2nd_moment(self.embed(c.to(torch.float32)))
+                y = normalize_2nd_moment(self.embed(c))#.to(torch.float32)))
                 x = torch.cat([x, y], dim=1) if x is not None else y # concat input & conditioning label
 
         # Main layers.
@@ -1297,20 +1298,24 @@ class FirstStage(nn.Module):
                  use_noise=False,
                  demodulate=True, 
                  activation='lrelu',
-                 use_4input = False,        # whether use masked edge & line images in high frequency
+                 use_edge = False,          # whether input masked edge images
+                 use_line = False,          # whether input masked line images
                  use_ln = False,            # Whether use LayerNormalization
                  few_high = False,          # Whether use fewer blocks in high-freqeuncy
                  ):
         super().__init__()
         res = 64
 
-        if use_4input: # 기존 그림과 다르게 그냥 처음부터 masked_image, mask, masked_edge, masked_line 정보 다 모아서 각 frequency에 넣어준다
+        if use_edge and use_line: # 기존 그림과 다르게 그냥 처음부터 masked_image, mask, masked_edge, masked_line 정보 다 모아서 각 frequency에 넣어준다
             self.conv_first = Conv2dLayerPartial(in_channels=img_channels+3, out_channels=dim, kernel_size=3, activation=activation) # gray scale의 edge & line도 추가
+        elif use_edge or use_line:
+            self.conv_first = Conv2dLayerPartial(in_channels=img_channels+2, out_channels=dim, kernel_size=3, activation=activation)
         else:
             self.conv_first = Conv2dLayerPartial(in_channels=img_channels+1, out_channels=dim, kernel_size=3, activation=activation)
 
         self.enc_conv = nn.ModuleList()
-        self.use_4input = use_4input
+        self.use_edge = use_edge
+        self.use_line = use_line
         self.few_high = few_high
 
         down_time = int(np.log2(img_resolution // res)) # 몇 번 resolution 줄일 것인지
@@ -1320,9 +1325,9 @@ class FirstStage(nn.Module):
                     Conv2dLayerPartial(in_channels=dim, out_channels=dim, kernel_size=3, down=2, activation=activation)
                 )
         # from 64 -> 16 -> 64
-        depths = [2, 3, 4, 3, 2]
+        depths = [1, 1, 1, 1, 1] # [2, 3, 4, 3, 2]
         ratios = [1, 1/2, 1/2, 2, 2]
-        head_num = 6
+        head_num = 1
 
         if self.few_high:
             high_depths = [1, 2, 2, 2, 1]
@@ -1386,10 +1391,15 @@ class FirstStage(nn.Module):
 
 
     def forward(self, images_in, masks_in, ws, noise_mode='random', edge = None, line = None):
+
         #(masks_in - 0.5): 마스크를 -0.5~0.5 범위로 이동 -> 평균 0으로 만들어서 네트워크가 마스크 정보를 더 잘 학습하도록 도와줌
         #(images_in * masks_in): 이미지에서 알려진(=마스크=1) 부분만 남긴 텐서 <- 얘는 image_in이 이미 normalize되어 있어서 이동 안하는 듯
-        if (edge is not None and line is not None) and self.use_4input: # edge와 line에 대한 정보도 살아있어야 함
+        if (edge is not None and line is not None) and (self.use_edge and self.use_line): # edge와 line에 대한 정보도 살아있어야 함
             x = torch.cat([masks_in - 0.5, images_in * masks_in, edge * masks_in, line * masks_in], dim = 1)
+        elif edge is not None and self.use_edge:
+            x = torch.cat([masks_in - 0.5, images_in * masks_in, edge * masks_in], dim = 1)
+        elif line is not None and self.use_line:
+            x = torch.cat([masks_in - 0.5, images_in * masks_in, line * masks_in], dim = 1)
         else: 
             x = torch.cat([masks_in - 0.5, images_in * masks_in], dim=1)
 
@@ -1501,9 +1511,10 @@ class SynthesisNet(nn.Module):
                  drop_rate      = 0.5,
                  use_noise      = True,
                  demodulate     = True,
-                 use_4input     = False,        # whether use masked edge & line images in high frequency
+                 use_edge       = False,        # whether input masked edge images
+                 use_line       = False,        # whether input masked line images
                  use_ln         = False,        # Whether use LayerNormalization
-                 few_high = False,          # Whether use fewer blocks in high-freqeuncy
+                 few_high       = False,        # Whether use fewer blocks in high-freqeuncy
                  ):
         super().__init__()
         resolution_log2 = int(np.log2(img_resolution))
@@ -1512,11 +1523,13 @@ class SynthesisNet(nn.Module):
         self.num_layers = resolution_log2 * 2 - 3 * 2
         self.img_resolution = img_resolution
         self.resolution_log2 = resolution_log2
-        self.use_4input = use_4input
+        self.use_edge = use_edge
+        self.use_line = use_line
 
         # first stage
         self.first_stage = FirstStage(img_channels, img_resolution=img_resolution, w_dim=w_dim, use_noise=False,
-                                      demodulate=demodulate, use_4input = use_4input, use_ln = use_ln, few_high = few_high)
+                                      demodulate=demodulate, use_edge = use_edge, use_line = use_line,
+                                      use_ln = use_ln, few_high = few_high)
 
         # second stage
         self.enc = Encoder(resolution_log2, img_channels, activation, patch_size=5, channels=16)
@@ -1566,7 +1579,8 @@ class Generator(nn.Module):
                  w_dim,                     # Intermediate latent (W) dimensionality.
                  img_resolution,            # resolution of generated image
                  img_channels,              # Number of input color channels.
-                 use_4input = False,        # whether input masked edge & line images
+                 use_edge = False,          # whether input masked edge images
+                 use_line = False,          # whether input masked line images
                  use_ln = False,            # Whether use LayerNormalization
                  few_high = False,          # Whether use fewer blocks in high-freqeuncy
                  synthesis_kwargs = {},     # Arguments for SynthesisNetwork.
@@ -1582,7 +1596,8 @@ class Generator(nn.Module):
         self.synthesis = SynthesisNet(w_dim=w_dim,
                                       img_resolution=img_resolution,
                                       img_channels=img_channels,
-                                      use_4input = use_4input,
+                                      use_edge = use_edge,
+                                      use_line = use_line,
                                       use_ln = use_ln,
                                       few_high = few_high,
                                       **synthesis_kwargs)
@@ -1690,16 +1705,18 @@ class Discriminator(torch.nn.Module):
 
 if __name__ == '__main__':
     # mac 환경이라서 그냥 cpu
-    device = torch.device('cuda:0')
-    batch = 1
-    res = 512
-    G = Generator(z_dim=512, c_dim=0, w_dim=512, img_resolution=512, img_channels=3, use_4input = True, use_ln = True, few_high = True).to(device)
+    device = torch.device('cuda')
+    batch = 2
+    res = 256
+    G = Generator(z_dim=256, c_dim=0, w_dim=256, img_resolution=256, img_channels=3, use_edge = True,
+                  use_line = False, use_ln = True, few_high = False).to(device)
+    
     D = Discriminator(c_dim=0, img_resolution=res, img_channels=3).to(device)
     img = torch.randn(batch, 3, res, res).to(device)
     mask = torch.randn(batch, 1, res, res).to(device)
     edge = torch.randn(batch, 1, res, res).to(device)
     line = torch.randn(batch, 1, res, res).to(device)
-    z = torch.randn(batch, 512).to(device)
+    z = torch.randn(batch, 256).to(device)
     G.eval()
 
     # def count(block):
@@ -1713,7 +1730,7 @@ if __name__ == '__main__':
 
 
     with torch.no_grad():
-        img, img_stg1, high_freq = G(img, mask, z, None, return_stg1=True, edge = edge, line = line)
+        img, img_stg1, high_freq = G(img, mask, z, None, return_stg1=True, edge = edge, line = None)
         #(B, 2, H, W)
         # index 0: edge
         # index 1: line

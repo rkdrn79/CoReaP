@@ -11,7 +11,7 @@ def get_arguments():
 
     # ======================== data ======================== #
     parser.add_argument('--data_path', type=str, default='data/')
-    parser.add_argument('--data_name', type=str, default='mnist')
+    parser.add_argument('--data_name', type=str, default='256')
     parser.add_argument('--bf16', type=bool, default=False)
 
     # ======================== loss ======================== #

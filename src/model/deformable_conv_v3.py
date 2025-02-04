@@ -397,7 +397,3 @@ class Deformable_Conv2d(nn.Module):
         x_offset = rearrange(x_offset, 'B C H W (KH KW) -> B C (H KH) (W KW)', KH = ks, KW = ks)
         
         return x_offset
-
-
-
-
