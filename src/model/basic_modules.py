@@ -1489,9 +1489,12 @@ class FirstStage(nn.Module):
         high = self.get_edge_line(feature2token(high)) #(B, 2, H, W)
         high = token2feature(high, high_size)
 
-        
-
         if (edge is not None) and (line is not None): # GT 있으면 unmask부분은 GT로 설정, 없으면 그냥 high 그대로 반환
+            if line is None:
+                line = torch.zeros_like(edge)
+            if edge is None:
+                edge = torch.zeros_like(line)
+
             high  = high * (1 - masks_in) + torch.cat([edge, line], dim = 1) * masks_in  # (B, 2, H, W)
 
         return img, high

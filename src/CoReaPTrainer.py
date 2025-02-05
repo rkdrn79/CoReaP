@@ -10,6 +10,7 @@ from torch.nn import L1Loss, BCEWithLogitsLoss
 from torch.cuda.amp import autocast
 
 from src.utils.losses.pcp import PerceptualLoss
+from src.utils.losses.focal import FocalLoss
 from src.utils.metrics import compute_metrics
 
 class CoReaPTrainer:
@@ -24,7 +25,7 @@ class CoReaPTrainer:
                  r1_gamma=10,
                  pcp_ratio=1.0,
                  l1_ratio=1.0,
-                 bce_ratio=1.0,
+                 high_freq_ratio=1.0,
                  epochs=100,
                  gradient_accumulation=1,
                  eval_steps=500,
@@ -46,7 +47,7 @@ class CoReaPTrainer:
         self.r1_gamma = r1_gamma
         self.pcp_ratio = pcp_ratio
         self.l1_ratio = l1_ratio
-        self.bce_ratio = bce_ratio
+        self.high_freq_ratio = high_freq_ratio
         self.pcp = PerceptualLoss(layer_weights=dict(conv4_4=1/4, conv5_4=1/2)).to(device)
         self.epochs = epochs
         self.gradient_accumulation = gradient_accumulation
@@ -58,11 +59,13 @@ class CoReaPTrainer:
             wandb.init(project=project_name, name=run_name or f"run_{time.strftime('%Y%m%d_%H%M%S')}")
         self.l1_loss = L1Loss()
         self.bce_loss = BCEWithLogitsLoss()
+        self.focal_loss = FocalLoss()
 
     def compute_d_loss(self, batch, train=True):
         img = batch['img'].to(self.device)
         mask_img = batch['mask_img'].to(self.device)
         edge = batch['edge'].to(self.device)
+        mask_edge_img = batch['mask_edge_img'].to(self.device)
         mask = batch['mask'].to(self.device)
 
         
@@ -74,7 +77,7 @@ class CoReaPTrainer:
             # bf16 autocast
             with autocast(dtype=torch.bfloat16 if self.args.bf16 else torch.float32):
                 gen_img, gen_img_stg1, high_freq = self.generator(
-                    mask_img, mask, z, None, return_stg1=True, edge=edge, line=None
+                    mask_img, mask, z, None, return_stg1=True, edge=mask_edge_img, line=None
                 )
 
         real_logits, _ = self.discriminator(img, mask, img, None)
@@ -101,6 +104,7 @@ class CoReaPTrainer:
         img = batch['img'].to(self.device)
         mask_img = batch['mask_img'].to(self.device)
         edge = batch['edge'].to(self.device)
+        mask_edge_img = batch['mask_edge_img'].to(self.device)
         mask = batch['mask'].to(self.device)
         
         z = torch.randn(img.size(0), img.size(2)).to(self.device)
@@ -110,7 +114,7 @@ class CoReaPTrainer:
         # bf16 autocast
         with autocast(dtype=torch.bfloat16 if self.args.bf16 else torch.float32):
             gen_img, gen_img_stg1, high_freq = self.generator(
-                mask_img, mask, z, None, return_stg1=True, edge=edge, line=None
+                mask_img, mask, z, None, return_stg1=True, edge=mask_edge_img, line=None
             )
         
         with torch.no_grad():
@@ -120,8 +124,9 @@ class CoReaPTrainer:
         g_loss_l1 = self.l1_loss(gen_img, img)
         pcp_loss, _ = self.pcp(gen_img, img)
         high_freq = high_freq[:, 0:1, :, :]
-        bce_loss = self.bce_loss(high_freq, edge)
-        g_loss = g_loss_gan + self.pcp_ratio * pcp_loss + self.l1_ratio * g_loss_l1 + self.bce_ratio * bce_loss
+        #high_freq_loss = self.bce_loss(high_freq, edge)
+        high_freq_loss = self.focal_loss(high_freq, edge)
+        g_loss = g_loss_gan + self.pcp_ratio * pcp_loss + self.l1_ratio * g_loss_l1 + self.high_freq_ratio * high_freq_loss
         
         return g_loss, gen_img, gen_img_stg1, high_freq
 
@@ -195,7 +200,10 @@ class CoReaPTrainer:
         total_loss = 0.0
 
         log_images = []
+        log_mask_images = []
         log_edges = []
+        log_mask_edges = []
+        log_masks = []
         log_gen_images = []
         log_high_freq = []
         with torch.no_grad():
@@ -206,7 +214,10 @@ class CoReaPTrainer:
 
                 # 첫번째 이미지만 로깅
                 log_images.append(batch['img'][0].cpu())
+                log_mask_images.append(batch['mask_img'][0].cpu())
                 log_edges.append(batch['edge'][0].cpu())
+                log_mask_edges.append(batch['mask_edge_img'][0].cpu())
+                log_masks.append(batch['mask'][0].cpu())
                 log_gen_images.append(gen_img[0].cpu())
                 log_high_freq.append(high_freq[0].cpu())
 
@@ -227,9 +238,13 @@ class CoReaPTrainer:
             # Log images
             wandb.log({
                 "eval/images": [wandb.Image(img) for img in log_images],
+                "eval/mask_images": [wandb.Image(mask_img) for mask_img in log_mask_images],
                 "eval/edges": [wandb.Image(edge) for edge in log_edges],
+                "eval/mask_edges": [wandb.Image(mask_edge_img) for mask_edge_img in log_mask_edges],
+                "eval/mask": [wandb.Image(mask) for mask in log_masks],
                 "eval/gen_images": [wandb.Image(gen_img) for gen_img in log_gen_images],
                 "eval/high_freq": [wandb.Image(high_freq) for high_freq in log_high_freq]
+
             })
         return metrics
 

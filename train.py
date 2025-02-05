@@ -83,6 +83,16 @@ def main(args):
     # WandB 초기화
     wandb.init(project='CoReaP', name=args.save_dir, config=args)
 
+    # model load
+    if args.load_model != None:
+        print(f"Load model from {args.load_model}")
+        checkpoint = torch.load(os.path.join(args.load_model))
+        generator.load_state_dict(checkpoint['generator'])
+        discriminator.load_state_dict(checkpoint['discriminator'])
+        g_optimizer.load_state_dict(checkpoint['g_optimizer'])
+        d_optimizer.load_state_dict(checkpoint['d_optimizer'])
+
+
     # 트레이너 설정
     trainer = CoReaPTrainer(
         generator=generator,
@@ -95,7 +105,7 @@ def main(args):
         r1_gamma=args.r1_gamma,
         pcp_ratio=args.pcp_ratio,
         l1_ratio=args.l1_ratio,
-        bce_ratio=args.bce_ratio,
+        high_freq_ratio=args.high_freq_ratio,
         epochs=args.num_train_epochs,
         gradient_accumulation=args.gradient_accumulation_steps,
         eval_steps=args.eval_steps,

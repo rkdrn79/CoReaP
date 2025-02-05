@@ -8,6 +8,7 @@ def get_arguments():
 
     # ======================== train, test ======================== #
     parser.add_argument('--is_train', type=bool, default=True)
+    parser.add_argument('--load_model', type=str, default=None)
 
     # ======================== data ======================== #
     parser.add_argument('--data_path', type=str, default='data/')
@@ -18,7 +19,7 @@ def get_arguments():
     parser.add_argument('--r1_gamma', type=float, default=10.0)
     parser.add_argument('--pcp_ratio', type=float, default=1.0)
     parser.add_argument('--l1_ratio', type=float, default=1.0)
-    parser.add_argument('--bce_ratio', type=float, default=1.0)
+    parser.add_argument('--high_freq_ratio', type=float, default=1.0)
 
 
     # ======================== training ======================== #
