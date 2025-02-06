@@ -13,6 +13,8 @@ from src.utils.losses.pcp import PerceptualLoss
 from src.utils.losses.focal import FocalLoss
 from src.utils.metrics import compute_metrics
 
+import pdb
+
 class CoReaPTrainer:
     def __init__(self, 
                  generator, 
@@ -106,6 +108,8 @@ class CoReaPTrainer:
         edge = batch['edge'].to(self.device)
         mask_edge_img = batch['mask_edge_img'].to(self.device)
         mask = batch['mask'].to(self.device)
+
+        losses = {}
         
         z = torch.randn(img.size(0), img.size(2)).to(self.device)
         if self.args.bf16:
@@ -123,12 +127,19 @@ class CoReaPTrainer:
         g_loss_gan = torch.nn.functional.softplus(-fake_logits).mean()
         g_loss_l1 = self.l1_loss(gen_img, img)
         pcp_loss, _ = self.pcp(gen_img, img)
-        high_freq = high_freq[:, 0:1, :, :]
-        #high_freq_loss = self.bce_loss(high_freq, edge)
-        high_freq_loss = self.focal_loss(high_freq, edge)
+        high_freq_loss_1 = self.focal_loss(high_freq[:, 0], edge)
+        high_freq_loss_2 = self.focal_loss(high_freq[:, 1], edge)
+        high_freq_loss = high_freq_loss_1 + high_freq_loss_2
         g_loss = g_loss_gan + self.pcp_ratio * pcp_loss + self.l1_ratio * g_loss_l1 + self.high_freq_ratio * high_freq_loss
         
-        return g_loss, gen_img, gen_img_stg1, high_freq
+        losses = {
+            "g_loss": g_loss,
+            "g_loss_gan": g_loss_gan,
+            "g_loss_l1": g_loss_l1,
+            "pcp_loss": pcp_loss,
+            "high_freq_loss": high_freq_loss
+        }
+        return g_loss, gen_img, gen_img_stg1, high_freq, losses
 
     def train_epoch(self, epoch):
         self.generator.train()
@@ -152,7 +163,7 @@ class CoReaPTrainer:
                 # Update Generator
                 self.discriminator.requires_grad_(False)
                 self.generator.requires_grad_(True)
-                g_loss, gen_img, _, _ = self.compute_g_loss(batch)
+                g_loss, gen_img, _, _, losses = self.compute_g_loss(batch)
                 scaled_g_loss = g_loss / self.gradient_accumulation
                 
                 scaled_g_loss.backward()
@@ -181,6 +192,10 @@ class CoReaPTrainer:
             if self.use_wandb and (batch_idx % 10 == 0):
                 wandb.log({
                     "train/g_loss": g_loss.item(),
+                    "train/g_loss_gan": losses["g_loss_gan"].item(),
+                    "train/g_loss_l1": losses["g_loss_l1"].item(),
+                    "train/pcp_loss": losses["pcp_loss"].item(),
+                    "train/high_freq_loss": losses["high_freq_loss"].item(),
                     "train/d_loss": d_loss.item(),
                     "epoch": epoch,
                     "step": epoch * len(self.train_loader) + batch_idx
@@ -198,6 +213,7 @@ class CoReaPTrainer:
     def evaluate(self):
         self.generator.eval()
         total_loss = 0.0
+        check_num = 10
 
         log_images = []
         log_mask_images = []
@@ -209,7 +225,7 @@ class CoReaPTrainer:
         with torch.no_grad():
             cnt = 0
             for batch in tqdm(self.val_loader, desc="Evaluation"):
-                g_loss, gen_img, _, high_freq = self.compute_g_loss(batch)
+                g_loss, gen_img, _, high_freq, losses = self.compute_g_loss(batch)
                 total_loss += g_loss.item()
 
                 # 첫번째 이미지만 로깅
@@ -219,17 +235,21 @@ class CoReaPTrainer:
                 log_mask_edges.append(batch['mask_edge_img'][0].cpu())
                 log_masks.append(batch['mask'][0].cpu())
                 log_gen_images.append(gen_img[0].cpu())
-                log_high_freq.append(high_freq[0].cpu())
+                log_high_freq.append(high_freq[0][0].cpu())
 
                 cnt += 1
 
-                if cnt == 10:
+                if cnt == check_num:
                     break
 
         if self.use_wandb:
             # Log loss
             wandb.log({
-                "eval/loss": total_loss / 10
+                "eval/g_loss": total_loss / check_num, 
+                "eval/g_loss_gan": losses["g_loss_gan"].item() / check_num,
+                "eval/g_loss_l1": losses["g_loss_l1"].item() / check_num,
+                "eval/pcp_loss": losses["pcp_loss"].item() / check_num,
+                "eval/high_freq_loss": losses["high_freq_loss"].item() / check_num
             })
 
             # TODO : Log Metrics
