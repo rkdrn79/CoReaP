@@ -750,8 +750,8 @@ class MHA(nn.Module):
 
         if mask is not None:
             attn, mask = self._calculate_mask(attn, mask) # (B, 1, L) # MCA: attn_mask = (-inf / 0)
-            attn_mask = mask.unsqueeze(-1).expand(-1, -1, -1, attn.size(-1)) # (B, 1, L, L) / mask 토큰에 해당하는 row에 대해서는 attention = 0
-            attn_mask = attn_mask.masked_fill(attn_mask == 0, float(-100.0))
+            attn_mask = mask.unsqueeze(-1).expand(-1, -1, -1, attn.size(-1))
+            attn_mask = attn_mask.masked_fill(attn_mask == 0, float(-100.0)).masked_fill(attn_mask == 1, float(0.0)) # (B, 1, L, L) / mask 토큰에 해당하는 row에 대해서는 attention = 0
             attn = attn + attn_mask # (B, H, L, L) 
 
             mask = mask.reshape(B, 1, H, W) # (B, 1, H, W)
