@@ -127,11 +127,10 @@ class CoReaPTrainer:
         g_loss_gan = torch.nn.functional.softplus(-fake_logits).mean()
         g_loss_l1 = self.l1_loss(gen_img, img)
         pcp_loss, _ = self.pcp(gen_img, img)
-        high_freq_loss_1 = self.focal_loss(high_freq[:, 0], edge)
-        high_freq_loss_2 = self.focal_loss(high_freq[:, 1], edge)
+        high_freq_loss_1 = self.focal_loss(high_freq[:, 0], edge) + self.l1_loss(high_freq[:, 0], edge)
+        high_freq_loss_2 = self.focal_loss(high_freq[:, 1], torch.zeros_like(edge)) + self.l1_loss(high_freq[:, 1], torch.zeros_like(edge))
         high_freq_loss = high_freq_loss_1 + high_freq_loss_2
         g_loss = g_loss_gan + self.pcp_ratio * pcp_loss + self.l1_ratio * g_loss_l1 + self.high_freq_ratio * high_freq_loss
-        
         losses = {
             "g_loss": g_loss,
             "g_loss_gan": g_loss_gan,

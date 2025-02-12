@@ -6,7 +6,6 @@ import torch.nn.functional as F
 from einops import rearrange
 from src.model.deformable_conv_v3 import Deformable_Conv2d
 
-import pdb
 
 #--------------------- 모듈 만드는 데에 필요한 함수 정의 -----------------------
 def get_style_code(a, b): # 그냥 concat
@@ -94,7 +93,7 @@ class FullyConnected_Layer(nn.Module):
         )
 
         self.bias = nn.Parameter(
-            torch.full([out_features], bias_init, dtype=torch.float32)
+            torch.full([out_features], np.float32(bias_init))
         ) if bias else None
 
         self.activation = activation
@@ -465,9 +464,9 @@ class MappingNet(torch.nn.Module): # Generator랑 Discriminator에 쓰이는 cla
         x = None
         with torch.autograd.profiler.record_function('input'): # 각 단계 프로파일링(CPU & GPU 사용량 등을 확인)을 위한 함수 (https://jh-bk.tistory.com/20)
             if self.z_dim > 0:
-                x = normalize_2nd_moment(z)#to(torch.float32))
+                x = normalize_2nd_moment(z.to(torch.float32))
             if self.c_dim > 0:
-                y = normalize_2nd_moment(self.embed(c))#.to(torch.float32)))
+                y = normalize_2nd_moment(self.embed(c.to(torch.float32)))
                 x = torch.cat([x, y], dim=1) if x is not None else y # concat input & conditioning label
 
         # Main layers.
@@ -683,6 +682,8 @@ class MHA(nn.Module):
 
         self.stride_kv = stride_kv
         self.stride_q = stride_q
+        self.padding_q = padding_q
+        self.padding_kv = padding_kv
         self.out_channels = out_channels
         self.head_num = head_num
         self.with_cls_token = with_cls_token
@@ -749,10 +750,11 @@ class MHA(nn.Module):
 
         if mask is not None:
             attn, mask = self._calculate_mask(attn, mask) # (B, 1, L) # MCA: attn_mask = (-inf / 0)
-            mask = mask.unsqueeze(-1).expand(-1, -1, -1, attn.size(-1)) # (B, 1, L, L) / mask 토큰에 해당하는 row에 대해서는 attention = 0
-            attn = attn + mask # (B, H, L, L) 
+            attn_mask = mask.unsqueeze(-1).expand(-1, -1, -1, attn.size(-1)) # (B, 1, L, L) / mask 토큰에 해당하는 row에 대해서는 attention = 0
+            attn_mask = attn_mask.masked_fill(attn_mask == 0, float(-100.0))
+            attn = attn + attn_mask # (B, H, L, L) 
 
-            mask = mask[..., 0].view(B, 1, H, W) # (B, 1, H, W)
+            mask = mask.reshape(B, 1, H, W) # (B, 1, H, W)
                 
 
         attn = self.softmax(attn)
@@ -774,7 +776,7 @@ class MHA(nn.Module):
                 with torch.no_grad():
                     if self.weight_maskUpdater.type() != attn.type():
                         self.weight_maskUpdater = self.weight_maskUpdater.to(attn)
-                    update_mask = F.conv2d(mask, self.weight_maskUpdater, bias=None, stride=self.stride, padding=self.padding) # mask 중에서 Kernel size 안에서 unmaksed point의 개수를 counting
+                    update_mask = F.conv2d(mask, self.weight_maskUpdater, bias=None, stride=self.stride_kv, padding=self.padding_kv) # mask 중에서 Kernel size 안에서 unmaksed point의 개수를 counting
                     mask_ratio = self.slide_winsize / (update_mask + 1e-8) # unmask 부분이 적을수록 ration는 커진다 -> 많은 부분이 mask 되어있다는 것을 반영
                     update_mask = torch.clamp(update_mask, 0, 1)  # update_mask는 0 ~ K^2로 정수단위임 -> 마스크된 부분이 있는지 여부만 궁금 -> 0 혹은 1로 clamping
                     mask_ratio = torch.mul(mask_ratio, update_mask) # conv를 통과한 후의 feature map 상의 update_mask를 conv 통과전에 unmask 부분이 얼마나 많이 있는지 비율을 고려하여 업데이트
@@ -1325,9 +1327,10 @@ class FirstStage(nn.Module):
                     Conv2dLayerPartial(in_channels=dim, out_channels=dim, kernel_size=3, down=2, activation=activation)
                 )
         # from 64 -> 16 -> 64
-        depths = [1, 1, 1, 1, 1] # [2, 3, 4, 3, 2]
+        #depths = [2, 3, 4, 3, 2]
+        depths = [1, 1, 1, 1, 1]
         ratios = [1, 1/2, 1/2, 2, 2]
-        head_num = 1
+        head_num = 6
 
         if self.few_high:
             high_depths = [1, 2, 2, 2, 1]
@@ -1489,6 +1492,8 @@ class FirstStage(nn.Module):
         high = self.get_edge_line(feature2token(high)) #(B, 2, H, W)
         high = token2feature(high, high_size)
 
+        
+
         if (edge is not None) or (line is not None): # GT 있으면 unmask부분은 GT로 설정, 없으면 그냥 high 그대로 반환
             if line is None:
                 line = torch.zeros_like(edge)
@@ -1565,6 +1570,7 @@ class SynthesisNet(nn.Module):
 
         # ensemble
         img = img * (1 - masks_in) + images_in * masks_in
+        
 
         if not return_stg1:
             return img, high_freq
@@ -1708,10 +1714,10 @@ class Discriminator(torch.nn.Module):
 
 if __name__ == '__main__':
     # mac 환경이라서 그냥 cpu
-    device = torch.device('cuda')
+    device = torch.device('cpu')
     batch = 2
-    res = 256
-    G = Generator(z_dim=256, c_dim=0, w_dim=256, img_resolution=256, img_channels=3, use_edge = True,
+    res = 512
+    G = Generator(z_dim=512, c_dim=0, w_dim=512, img_resolution=512, img_channels=3, use_edge = True,
                   use_line = False, use_ln = True, few_high = False).to(device)
     
     D = Discriminator(c_dim=0, img_resolution=res, img_channels=3).to(device)
@@ -1719,7 +1725,7 @@ if __name__ == '__main__':
     mask = torch.randn(batch, 1, res, res).to(device)
     edge = torch.randn(batch, 1, res, res).to(device)
     line = torch.randn(batch, 1, res, res).to(device)
-    z = torch.randn(batch, 256).to(device)
+    z = torch.randn(batch, 512).to(device)
     G.eval()
 
     # def count(block):
@@ -1741,3 +1747,5 @@ if __name__ == '__main__':
     print('output of G:', img.shape, img_stg1.shape, high_freq.shape)
     score, score_stg1 = D(img, mask, img_stg1, None)
     print('output of D:', score.shape, score_stg1.shape)
+
+
