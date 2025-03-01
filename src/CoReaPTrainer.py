@@ -11,9 +11,7 @@ from torch.cuda.amp import autocast
 
 from src.utils.losses.pcp import PerceptualLoss
 from src.utils.losses.focal import FocalLoss
-from src.utils.metrics import compute_metrics
-
-import pdb
+# from src.utils.metrics import compute_metrics  # 필요시 사용
 
 class CoReaPTrainer:
     def __init__(self, 
@@ -24,10 +22,9 @@ class CoReaPTrainer:
                  g_optimizer,
                  d_optimizer,
                  device,
+                 pcp_gamma=1.0,
                  r1_gamma=10,
-                 pcp_ratio=1.0,
-                 l1_ratio=1.0,
-                 high_freq_ratio=1.0,
+                 high_freq_gamma=1.0,
                  epochs=100,
                  gradient_accumulation=1,
                  eval_steps=500,
@@ -45,12 +42,13 @@ class CoReaPTrainer:
         self.d_optim = d_optimizer
         self.device = device
 
-        # Other initialization remains the same
         self.r1_gamma = r1_gamma
-        self.pcp_ratio = pcp_ratio
-        self.l1_ratio = l1_ratio
-        self.high_freq_ratio = high_freq_ratio
+        self.pcp_gamma = pcp_gamma
+        self.high_freq_gamma = high_freq_gamma
+
+        # Perceptual Loss (PCP)
         self.pcp = PerceptualLoss(layer_weights=dict(conv4_4=1/4, conv5_4=1/2)).to(device)
+
         self.epochs = epochs
         self.gradient_accumulation = gradient_accumulation
         self.eval_steps = eval_steps
@@ -63,82 +61,82 @@ class CoReaPTrainer:
         self.bce_loss = BCEWithLogitsLoss()
         self.focal_loss = FocalLoss()
 
-    def compute_d_loss(self, batch, train=True):
+    def compute_losses(self, batch, train=True):
+        """
+        한 번의 generator forward pass로 Generator 및 Discriminator 손실을 함께 계산합니다.
+        """
+        # 데이터 로딩 (c를 포함)
         img = batch['img'].to(self.device)
         mask_img = batch['mask_img'].to(self.device)
         edge = batch['edge'].to(self.device)
         mask_edge_img = batch['mask_edge_img'].to(self.device)
         mask = batch['mask'].to(self.device)
+        c = None
 
-        
-        with torch.no_grad():
-            z = torch.randn(img.size(0), img.size(2)).to(self.device)
-            if self.args.bf16:
-                z = z.to(dtype=torch.bfloat16)
-            
-            # bf16 autocast
-            with autocast(dtype=torch.bfloat16 if self.args.bf16 else torch.float32):
-                gen_img, gen_img_stg1, high_freq = self.generator(
-                    mask_img, mask, z, None, return_stg1=True, edge=mask_edge_img, line=None
-                )
-
-        real_logits, _ = self.discriminator(img, mask, img, None)
-        fake_logits, _ = self.discriminator(gen_img.detach(), mask, gen_img_stg1.detach(), None)
-        
-        d_loss_real = torch.nn.functional.softplus(-real_logits).mean()
-        d_loss_fake = torch.nn.functional.softplus(fake_logits).mean()
-        d_loss = d_loss_real + d_loss_fake
-        
-        if self.r1_gamma > 0 and train:
-            real_img = img.detach().requires_grad_(True)
-            real_logits, _ = self.discriminator(real_img, mask, real_img, None)
-            r1_grads = torch.autograd.grad(
-                outputs=real_logits.sum(),
-                inputs=real_img,
-                create_graph=True
-            )[0]
-            r1_penalty = r1_grads.pow(2).sum([1,2,3]).mean()
-            d_loss += self.r1_gamma * 0.5 * r1_penalty
-        
-        return d_loss, gen_img, gen_img_stg1, high_freq
-
-    def compute_g_loss(self, batch):
-        img = batch['img'].to(self.device)
-        mask_img = batch['mask_img'].to(self.device)
-        edge = batch['edge'].to(self.device)
-        mask_edge_img = batch['mask_edge_img'].to(self.device)
-        mask = batch['mask'].to(self.device)
-
-        losses = {}
-        
+        # 랜덤 벡터 z 생성 (모델에 맞게 차원 확인)
         z = torch.randn(img.size(0), img.size(2)).to(self.device)
         if self.args.bf16:
             z = z.to(dtype=torch.bfloat16)
 
-        # bf16 autocast
         with autocast(dtype=torch.bfloat16 if self.args.bf16 else torch.float32):
+            # generator forward pass 한 번 실행
             gen_img, gen_img_stg1, high_freq = self.generator(
                 mask_img, mask, z, None, return_stg1=True, edge=mask_edge_img, line=None
             )
-        
-        with torch.no_grad():
-            fake_logits, _ = self.discriminator(gen_img, mask, gen_img_stg1, None)
-        
-        g_loss_gan = torch.nn.functional.softplus(-fake_logits).mean()
-        g_loss_l1 = self.l1_loss(gen_img, img)
-        pcp_loss, _ = self.pcp(gen_img, img)
-        high_freq_loss_1 = self.focal_loss(high_freq[:, 0], edge) + self.l1_loss(high_freq[:, 0], edge)
-        high_freq_loss_2 = self.focal_loss(high_freq[:, 1], torch.zeros_like(edge)) + self.l1_loss(high_freq[:, 1], torch.zeros_like(edge))
-        high_freq_loss = high_freq_loss_1 + high_freq_loss_2
-        g_loss = g_loss_gan + self.pcp_ratio * pcp_loss + self.l1_ratio * g_loss_l1 + self.high_freq_ratio * high_freq_loss
+
+            # Generator 손실용: Discriminator에 그대로 통과 (generator의 gradient 흐름 유지)
+            fake_logits_g, fake_logits_stg1_g = self.discriminator(gen_img, mask, gen_img_stg1, c)
+            loss_Gmain = torch.nn.functional.softplus(-fake_logits_g)
+            loss_Gmain_stg1 = torch.nn.functional.softplus(-fake_logits_stg1_g)
+            pcp_loss, _ = self.pcp(gen_img, img)
+            # High Frequency Loss: 첫 번째 채널는 edge, 두 번째 채널은 0 텐서와 비교
+            high_freq_loss_1 = self.focal_loss(high_freq[:, 0], edge) + self.l1_loss(high_freq[:, 0], edge)
+            high_freq_loss_2 = self.focal_loss(high_freq[:, 1], torch.zeros_like(edge)) + self.l1_loss(high_freq[:, 1], torch.zeros_like(edge))
+            high_freq_loss = high_freq_loss_1 + high_freq_loss_2
+
+            g_loss = loss_Gmain.mean() + loss_Gmain_stg1.mean() + self.pcp_gamma * pcp_loss + self.high_freq_gamma * high_freq_loss
+
+            # Discriminator 손실용: generator 출력은 detach하여 generator의 gradient 차단
+            fake_logits_d, fake_logits_stg1_d = self.discriminator(gen_img.detach(), mask, gen_img_stg1.detach(), c)
+            loss_Dgen = torch.nn.functional.softplus(fake_logits_d)
+            loss_Dgen_stg1 = torch.nn.functional.softplus(fake_logits_stg1_d)
+
+            # 실제 이미지에 대한 Discriminator 예측
+            real_logits, real_logits_stg1 = self.discriminator(img, mask, img, c)
+            loss_Dreal = torch.nn.functional.softplus(-real_logits)
+            loss_Dreal_stg1 = torch.nn.functional.softplus(-real_logits_stg1)
+
+            # R1 정규화: 실제 이미지에 대한 gradient 계산
+            if train:
+                img_tmp = img.detach().requires_grad_(True)
+                real_logits_reg, real_logits_reg_stg1 = self.discriminator(img_tmp, mask, img_tmp, c)
+                r1_grads = torch.autograd.grad(outputs=real_logits_reg.sum(), inputs=img_tmp, create_graph=True)[0]
+                r1_penalty = r1_grads.pow(2).sum([1, 2, 3]).mean()
+                r1_loss = r1_penalty * (self.r1_gamma / 2)
+            else:
+                r1_loss = torch.tensor(0.0).to(img.device)
+
+            d_loss = loss_Dgen.mean() + loss_Dgen_stg1.mean() + loss_Dreal.mean() + loss_Dreal_stg1.mean() + r1_loss
+
         losses = {
             "g_loss": g_loss,
-            "g_loss_gan": g_loss_gan,
-            "g_loss_l1": g_loss_l1,
+            "loss_Gmain": loss_Gmain.mean(),
+            "loss_Gmain_stg1": loss_Gmain_stg1.mean(),
             "pcp_loss": pcp_loss,
-            "high_freq_loss": high_freq_loss
+            "high_freq_loss": high_freq_loss,
+            "d_loss": d_loss,
+            "loss_Dgen": loss_Dgen.mean(),
+            "loss_Dgen_stg1": loss_Dgen_stg1.mean(),
+            "loss_Dreal": loss_Dreal.mean(),
+            "loss_Dreal_stg1": loss_Dreal_stg1.mean(),
+            "r1_loss": r1_loss
         }
-        return g_loss, gen_img, gen_img_stg1, high_freq, losses
+        outputs = {
+            "gen_img": gen_img,
+            "gen_img_stg1": gen_img_stg1,
+            "high_freq": high_freq
+        }
+        return g_loss, d_loss, losses, outputs
 
     def train_epoch(self, epoch):
         self.generator.train()
@@ -146,68 +144,61 @@ class CoReaPTrainer:
         total_g_loss = 0.0
         total_d_loss = 0.0
         accum_step = 0
-        
-        
-        for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f"Epoch {epoch+1}")):
-            # Mixed precision training
-            with autocast(enabled=self.args.bf16, dtype=torch.bfloat16):
-                # Update Discriminator
-                self.discriminator.requires_grad_(True)
-                self.generator.requires_grad_(False)
-                d_loss, _, _, _ = self.compute_d_loss(batch)
-                scaled_d_loss = d_loss / self.gradient_accumulation
-               
-                scaled_d_loss.backward()
 
-                # Update Generator
-                self.discriminator.requires_grad_(False)
-                self.generator.requires_grad_(True)
-                g_loss, gen_img, _, _, losses = self.compute_g_loss(batch)
-                scaled_g_loss = g_loss / self.gradient_accumulation
-                
-                scaled_g_loss.backward()
-            
+        for batch_idx, batch in enumerate(tqdm(self.train_loader, desc=f"Epoch {epoch+1}")):
+            # 한 배치당 forward pass 1회로 두 손실을 모두 계산
+            with autocast(enabled=self.args.bf16, dtype=torch.bfloat16 if self.args.bf16 else torch.float32):
+                g_loss, d_loss, losses, outputs = self.compute_losses(batch)
+            # gradient accumulation에 따라 backward 수행 (두 네트워크 업데이트를 분리)
             accum_step += 1
+
+            # Discriminator 업데이트 (generator forward 결과는 detach되어 있으므로 문제없음)
+            self.discriminator.requires_grad_(True)
+            self.generator.requires_grad_(False)
+            d_loss.backward(retain_graph=True)
+
+            # Generator 업데이트
+            self.discriminator.requires_grad_(False)
+            self.generator.requires_grad_(True)
+            g_loss.backward()
+
             if accum_step % self.gradient_accumulation == 0:
-                
                 # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), max_norm=1.0)
                 torch.nn.utils.clip_grad_norm_(self.generator.parameters(), max_norm=1.0)
-                
-                # Optimizer step
+
+                # Optimizer step 및 gradient 초기화
                 self.d_optim.step()
                 self.g_optim.step()
-                
-                # Zero gradients
                 self.d_optim.zero_grad()
                 self.g_optim.zero_grad()
                 accum_step = 0
-            
-            # Accumulate losses (reduce across all processes)
+
             total_d_loss += d_loss.item()
             total_g_loss += g_loss.item()
-            
-            # WandB logging only on rank 0
+
+            # WandB 로깅 (10 iter마다)
             if self.use_wandb and (batch_idx % 10 == 0):
                 wandb.log({
                     "train/g_loss": g_loss.item(),
-                    "train/g_loss_gan": losses["g_loss_gan"].item(),
-                    "train/g_loss_l1": losses["g_loss_l1"].item(),
+                    "train/loss_Gmain": losses["loss_Gmain"].item(),
+                    "train/loss_Gmain_stg1": losses["loss_Gmain_stg1"].item(),
                     "train/pcp_loss": losses["pcp_loss"].item(),
                     "train/high_freq_loss": losses["high_freq_loss"].item(),
                     "train/d_loss": d_loss.item(),
+                    "train/loss_Dgen": losses["loss_Dgen"].item(),
+                    "train/loss_Dgen_stg1": losses["loss_Dgen_stg1"].item(),
+                    "train/loss_Dreal": losses["loss_Dreal"].item(),
+                    "train/loss_Dreal_stg1": losses["loss_Dreal_stg1"].item(),
+                    "train/r1_loss": losses["r1_loss"].item(),
                     "epoch": epoch,
                     "step": epoch * len(self.train_loader) + batch_idx
                 })
-                
-            
-            if (batch_idx + 1) % self.eval_steps == 0:
-                eval_metrics = self.evaluate()
-                if self.use_wandb == 0:
-                    wandb.log(eval_metrics)
-            
-        return total_g_loss / len(self.train_loader), total_d_loss / len(self.train_loader)
 
+            if (batch_idx + 1) % self.eval_steps == 0:
+                self.evaluate()
+
+        return total_g_loss / len(self.train_loader), total_d_loss / len(self.train_loader)
 
     def evaluate(self):
         self.generator.eval()
@@ -224,48 +215,33 @@ class CoReaPTrainer:
         with torch.no_grad():
             cnt = 0
             for batch in tqdm(self.val_loader, desc="Evaluation"):
-                g_loss, gen_img, _, high_freq, losses = self.compute_g_loss(batch)
+                g_loss, d_loss, losses, outputs = self.compute_losses(batch, train=False)
                 total_loss += g_loss.item()
 
-                # 첫번째 이미지만 로깅
                 log_images.append(batch['img'][0].cpu())
                 log_mask_images.append(batch['mask_img'][0].cpu())
                 log_edges.append(batch['edge'][0].cpu())
                 log_mask_edges.append(batch['mask_edge_img'][0].cpu())
                 log_masks.append(batch['mask'][0].cpu())
-                log_gen_images.append(gen_img[0].cpu())
-                log_high_freq.append(high_freq[0][0].cpu())
-
+                log_gen_images.append(outputs['gen_img'][0].cpu())
+                log_high_freq.append(outputs['high_freq'][0][0].cpu())
                 cnt += 1
-
                 if cnt == check_num:
                     break
 
         if self.use_wandb:
-            # Log loss
             wandb.log({
-                "eval/g_loss": total_loss / check_num, 
-                "eval/g_loss_gan": losses["g_loss_gan"].item() / check_num,
-                "eval/g_loss_l1": losses["g_loss_l1"].item() / check_num,
-                "eval/pcp_loss": losses["pcp_loss"].item() / check_num,
-                "eval/high_freq_loss": losses["high_freq_loss"].item() / check_num
+                "eval/g_loss": total_loss / check_num
             })
-
-            # TODO : Log Metrics
-            metrics = None #compute_metrics(log_images, log_gen_images)
-
-            # Log images
             wandb.log({
                 "eval/images": [wandb.Image(img) for img in log_images],
                 "eval/mask_images": [wandb.Image(mask_img) for mask_img in log_mask_images],
                 "eval/edges": [wandb.Image(edge) for edge in log_edges],
-                "eval/mask_edges": [wandb.Image(mask_edge_img) for mask_edge_img in log_mask_edges],
-                "eval/mask": [wandb.Image(mask) for mask in log_masks],
+                "eval/mask_edges": [wandb.Image(mask_edge) for mask_edge in log_mask_edges],
+                "eval/masks": [wandb.Image(mask) for mask in log_masks],
                 "eval/gen_images": [wandb.Image(gen_img) for gen_img in log_gen_images],
-                "eval/high_freq": [wandb.Image(high_freq) for high_freq in log_high_freq]
-
+                "eval/high_freq": [wandb.Image(hf) for hf in log_high_freq]
             })
-        return metrics
 
     def save_checkpoint(self, epoch):
         checkpoint = {
@@ -285,7 +261,7 @@ class CoReaPTrainer:
                 wandb.log({
                     "epoch/avg_g_loss": avg_g_loss,
                     "epoch/avg_d_loss": avg_d_loss,
-                    "epoch/time": time.time()-start_time
+                    "epoch/time": time.time() - start_time
                 })
             if (epoch + 1) % 5 == 0:
                 self.save_checkpoint(epoch + 1)

@@ -81,7 +81,7 @@ def main(args):
         torch.backends.cuda.cufft_plan_cache.clear()
 
     # WandB 초기화
-    wandb.init(project='CoReaP', name=args.save_dir, config=args)
+    wandb.init(project='CoReaP_1', name=args.save_dir, config=args)
 
     # model load
     if args.load_model != None:
@@ -103,9 +103,8 @@ def main(args):
         d_optimizer=d_optimizer,
         device=device,
         r1_gamma=args.r1_gamma,
-        pcp_ratio=args.pcp_ratio,
-        l1_ratio=args.l1_ratio,
-        high_freq_ratio=args.high_freq_ratio,
+        pcp_gamma=args.pcp_gamma,
+        high_freq_gamma=args.high_freq_gamma,
         epochs=args.num_train_epochs,
         gradient_accumulation=args.gradient_accumulation_steps,
         eval_steps=args.eval_steps,

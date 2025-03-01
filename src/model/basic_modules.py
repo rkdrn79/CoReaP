@@ -24,8 +24,8 @@ def feature2token(x):
     x = x.view(B, C, -1).transpose(1, 2)
     return x
 
-def nf(stage, channel_base=32768, channel_decay=1.0, channel_max=512):
-    NF = {512: 64, 256: 128, 128: 256, 64: 512, 32: 512, 16: 512, 8: 512, 4: 512}
+def nf(stage, channel_base=32768, channel_decay=1.0, channel_max=256):
+    NF = {channel_max: 64, 256: 128, 128: 256, 64: channel_max, 32: channel_max, 16: channel_max, 8: channel_max, 4: channel_max}
     return NF[2 ** stage]
 
 class linear(nn.Module):
