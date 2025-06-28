@@ -17,7 +17,7 @@
 ## 📄 [Paper](https://drive.google.com/file/d/1XPNHgS_uMzxiyjG3sSu1nkmrKbZIQuwL/view?usp=drive_link)
 
 ### 🖼️ Model Overview
-![overview](./assets/CoReaP.png)
+![overview](./assets/coreap_teaser.png)
 
 ---
 
