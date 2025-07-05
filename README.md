@@ -28,3 +28,6 @@ Image inpainting aims to restore missing regions in images by generating semanti
 
 ---
 
+## 🚧 Experiment Not Conducted  
+Although the model architecture is implemented, **full-scale experiments have not been conducted due to limited computational resources**.  
+This repository currently focuses on the model structure and core ideas; training and evaluation scripts are included for reference but not yet tested end-to-end.
